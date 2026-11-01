@@ -130,12 +130,16 @@
         program = "${pkgs.writeShellApplication {
           name = "mmdebstrap-rootfs";
           runtimeInputs = [
-            inputs.self.packages.${system}.mmdebstrap
-            pkgs.coreutils
-            pkgs.cpio
-            pkgs.curl
-            pkgs.e2fsprogs
-            pkgs.findutils
+             inputs.self.packages.${system}.mmdebstrap
+             pkgs.coreutils
+             pkgs.cpio
+             pkgs.curl
+             pkgs.apt
+             pkgs.debootstrap
+             pkgs.dpkg
+             pkgs.e2fsprogs
+             pkgs.findutils
+             pkgs.gnused
              pkgs.gnutar
              pkgs.gawk
              pkgs.qemu
@@ -163,6 +167,8 @@
                 target_kernel="${targetPkgs."x86_64-linux".linuxPackages.kernel}/bzImage"
                 target_modules="${targetPkgs."x86_64-linux".linuxPackages.kernel.modules}/lib/modules"
                 target_busybox="${targetPkgs."x86_64-linux".pkgsStatic.busybox}/bin/busybox"
+                target_debootstrap="${targetPkgs."x86_64-linux".debootstrap}/bin/debootstrap"
+                target_debootstrap_dir="${targetPkgs."x86_64-linux".debootstrap}/share/debootstrap"
                 ;;
               x86_64:arm64)
                 native=no
@@ -170,6 +176,8 @@
                 target_kernel="${targetPkgs."aarch64-linux".linuxPackages.kernel}/Image"
                 target_modules="${targetPkgs."aarch64-linux".linuxPackages.kernel.modules}/lib/modules"
                 target_busybox="${targetPkgs."aarch64-linux".pkgsStatic.busybox}/bin/busybox"
+                target_debootstrap="${targetPkgs."aarch64-linux".debootstrap}/bin/debootstrap"
+                target_debootstrap_dir="${targetPkgs."aarch64-linux".debootstrap}/share/debootstrap"
                 ;;
               *)
                 printf 'unsupported host/target architecture pair: %s -> %s\n' "$host_arch" "$arch" >&2
@@ -188,17 +196,18 @@
             case "$distro" in
               debian)
                 case "$arch" in
-                  amd64|arm64) ;;
+                  amd64) kernel=linux-image-amd64 ;;
+                  arm64) kernel=linux-image-arm64 ;;
                   *) printf 'unsupported Debian architecture: %s\n' "$arch" >&2; exit 2 ;;
                 esac
                 mirror=https://deb.debian.org/debian
                 keyring=${pkgs.debian-archive-keyring}/etc/apt/trusted.gpg.d
-                 packages="systemd-sysv,systemd,udev,passwd,debian-archive-keyring"
+                packages="apt,dpkg,$kernel,initramfs-tools,initramfs-tools-core,kmod,busybox-static,tar,systemd-sysv,systemd,udev,passwd,debian-archive-keyring,usr-is-merged"
                 components=()
                 ;;
               ubuntu)
                 case "$arch" in
-                  amd64|arm64) ;;
+                  amd64|arm64) kernel=linux-image-virtual ;;
                   *) printf 'unsupported Ubuntu architecture: %s\n' "$arch" >&2; exit 2 ;;
                 esac
                  if [[ "$arch" == amd64 ]]; then
@@ -213,7 +222,7 @@
                   --output "$keyring_dir/etc/apt/trusted.gpg.d/ubuntu-archive-keyring.gpg" \
                   "$mirror/project/ubuntu-archive-keyring.gpg"
                 keyring="$keyring_dir/etc/apt/trusted.gpg.d"
-                 packages="systemd-sysv,systemd,udev,passwd,ubuntu-keyring"
+                packages="apt,dpkg,$kernel,initramfs-tools,initramfs-tools-core,kmod,busybox-static,tar,systemd-sysv,systemd,udev,passwd,ubuntu-keyring,usr-is-merged"
                 components=("--components=main,universe")
                 ;;
               *) printf 'unsupported distribution: %s\n' "$distro" >&2; exit 2 ;;
@@ -249,15 +258,15 @@ EOF
             }
             trap cleanup_work EXIT
             chmod 755 "$work"
-            rootdir="$work/root"
-            mkdir -p "$rootdir"
+            downloadroot="$work/download"
+            mkdir -p "$downloadroot"
             repo="$work/repo"
             mkdir -p "$repo"
-            mmdebstrap --mode=fakechroot --skip=check/qemu --skip=cleanup/apt \
-              --extract-hook="sync-out /var/cache/apt/archives $repo" \
+            mmdebstrap --mode=fakechroot --skip=check/qemu --skip=cleanup/apt --skip=essential/unlink \
               --architectures="$arch" --keyring="$keyring" \
               "''${components[@]}" --format=directory --variant=extract \
-              --include='?essential' --include="$packages" "$suite" "$rootdir" "$mirror"
+              --include='?essential' --include="$packages" "$suite" "$downloadroot" "$mirror"
+            cp -r "$downloadroot/var/cache/apt/archives/." "$repo/"
 
             kernel_file="$target_kernel"
             busybox_file="$target_busybox"
@@ -267,21 +276,25 @@ EOF
             }
 
              initrd="$work/initrd"
-             mkdir -p "$initrd/bin" "$initrd/dev" "$initrd/proc" "$initrd/sys" "$initrd/newroot" "$initrd/lib"
+             mkdir -p "$initrd/bin" "$initrd/dev" "$initrd/proc" "$initrd/sys" "$initrd/newroot" "$initrd/mnt/host" "$initrd/mnt/repo" "$initrd/nix" "$initrd/lib"
             cp "$busybox_file" "$initrd/bin/busybox"
-            for applet in sh mount umount mkdir mknod modprobe ls cat ln touch switch_root chroot poweroff; do
+            for applet in sh mount umount mkdir mknod modprobe ls cat cp ln rm touch switch_root chroot poweroff; do
               ln -s busybox "$initrd/bin/$applet"
             done
             if [[ -d "$target_modules" ]]; then
               cp -r "$target_modules" "$initrd/lib/"
               chmod -R u+w "$initrd/lib/modules"
             fi
+            vm_packages="''${packages//,/ }"
             printf '%s\n' \
                '#!/bin/sh' \
+               'set -x' \
+               'set -e' \
+               'trap "poweroff -f" EXIT' \
                'export PATH=/usr/sbin:/usr/bin:/sbin:/bin' \
                'mount -t devtmpfs devtmpfs /dev' \
               'mount -t proc proc /proc' \
-              'mount -t sysfs sysfs /sys' \
+               'mount -t sysfs sysfs /sys' \
                'modprobe -v virtio_pci' \
                'modprobe -v virtio_blk' \
                'modprobe -v ext4' \
@@ -289,43 +302,106 @@ EOF
                'modprobe -v 9p' \
                'modprobe -v 9pnet_virtio' \
                'mount -t ext4 /dev/vda /newroot' \
-               'mkdir -p /newroot/mnt/host' \
-               'mount -t 9p -o trans=virtio,version=9p2000.L hostshare /newroot/mnt/host 2>/dev/null || true' \
-               'chroot /newroot dpkg --unpack /mnt/host/repo/*.deb || true' \
-               'chroot /newroot dpkg --configure --pending || true' \
+               'mount -t ext4 -o ro /dev/vdb /mnt/repo' \
+               'mount -t 9p -o trans=virtio,version=9p2000.L hostshare /mnt/host' \
+               'mount -t 9p -o trans=virtio,version=9p2000.L nixshare /nix' \
+               'mkdir -p /newroot/mnt/repo' \
+               'mount -o bind,ro /mnt/repo /newroot/mnt/repo' \
+               'export DEBIAN_FRONTEND=noninteractive' \
+               'export DEBOOTSTRAP_DIR=/mnt/host/debootstrap' \
+               "''${target_debootstrap} --verbose --arch=$arch --unpack-tarball=/mnt/repo/bootstrap.tar.gz $suite /newroot file:///mnt/repo" \
+               'mount -t proc proc /newroot/proc' \
+               'mount -t sysfs sysfs /newroot/sys' \
+               'mount -t devtmpfs devtmpfs /newroot/dev' \
+               "chroot /newroot sh -c 'dpkg --force-overwrite --force-confold --skip-same-version --unpack /var/cache/apt/archives/*.deb'" \
+               'chroot /newroot dpkg --configure -a || true' \
+               "printf 'deb [trusted=yes] file:/mnt/repo $suite main\\n' > /newroot/etc/apt/sources.list" \
+               'rm -f /newroot/etc/apt/sources.list.d/*' \
+               "chroot /newroot apt-get -o APT::Sandbox::User=root update" \
+               "chroot /newroot apt-get -o APT::Sandbox::User=root --yes --fix-broken install" \
+               "chroot /newroot apt-get -o APT::Sandbox::User=root --yes --no-install-recommends install $vm_packages" \
                'echo root:root | chroot /newroot chpasswd || true' \
                'printf "proc /proc proc defaults 0 0\\n" > /newroot/etc/fstab' \
                'mkdir -p /newroot/etc/systemd/system/getty.target.wants' \
                "ln -sf /lib/systemd/system/getty@.service /newroot/etc/systemd/system/getty.target.wants/getty@''${console}.service" \
-               'touch /newroot/mnt/host/rootfs-bootstrap-success 2>/dev/null || true' \
+               'touch /mnt/host/rootfs-bootstrap-success 2>/dev/null || true' \
+               "set -- /newroot/boot/vmlinuz-*; cp \"\$1\" /mnt/host/rootfs.kernel" \
+               "set -- /newroot/boot/initrd.img-*; cp \"\$1\" /mnt/host/rootfs.initrd" \
                'mkdir -p /newroot/etc/systemd/system/multi-user.target.wants' \
                'printf "%s\\n" "[Unit]" "Description=Rootfs bootstrap test shutdown" "After=multi-user.target" "[Service]" "Type=oneshot" "ExecStart=/sbin/poweroff -f" "[Install]" "WantedBy=multi-user.target" > /newroot/etc/systemd/system/rootfs-bootstrap-shutdown.service' \
                'ln -sf /etc/systemd/system/rootfs-bootstrap-shutdown.service /newroot/etc/systemd/system/multi-user.target.wants/rootfs-bootstrap-shutdown.service' \
-               'umount /newroot/mnt/host 2>/dev/null || true' \
+               'umount /mnt/host 2>/dev/null || true' \
+               'umount /newroot/mnt/repo' \
+               'umount /mnt/repo' \
+               'umount /nix' \
+               'trap - EXIT' \
                'exec switch_root /newroot /sbin/init' \
               > "$initrd/init"
             chmod 755 "$initrd/init"
             (cd "$initrd" && find . -print0 | cpio --null --create --format=newc) > "$work/initrd.img"
 
-            used_kb=$(du --summarize --block-size=1024 "$rootdir" | cut -f1)
-            blocks=$((used_kb * 2 + 65536))
+            blocks=2097152
             truncate --size=$((blocks * 4096)) "$image"
-            mke2fs -q -F -t ext4 -d "$rootdir" "$image" "$blocks"
+            mke2fs -q -F -t ext4 "$image" "$blocks"
             hostshare="$work/share"
             mkdir -p "$hostshare"
-            cp -r "$repo" "$hostshare/repo"
-            chmod -R u+w "$hostshare/repo"
-            timeout --foreground 60 "$qemu" -machine "$machine" -m 1024 -nographic \
+            cp -r "$target_debootstrap_dir" "$hostshare/debootstrap"
+            chmod -R u+w "$hostshare/debootstrap"
+            sed -i "s/^[[:space:]]*setup_available \$required \$base$/\t: # target apt handles the base set/" \
+              "$hostshare/debootstrap/scripts/debian-common"
+            deb_count=$(find "$repo" -type f -name '*.deb' | wc -l)
+            if (( deb_count == 0 )); then
+              printf 'host package repository is empty: %s\n' "$repo" >&2
+              exit 1
+            fi
+            repo_index="$repo/dists/$suite/main/binary-$arch"
+            mkdir -p "$repo_index"
+            (cd "$repo" && dpkg-scanpackages --multiversion . /dev/null) \
+              > "$repo_index/Packages"
+            gzip --no-name --force "$repo_index/Packages"
+            {
+              printf '%s\n' "Suite: $suite" "Codename: $suite" 'Components: main' "Architectures: $arch"
+              (cd "$repo/dists/$suite" && apt-ftparchive release .)
+            } > "$repo_index/../../Release"
+            debootstrap --arch="$arch" --variant=minbase --no-check-gpg \
+              --make-tarball="$repo/bootstrap.tar.gz" \
+              "$suite" "$work/debootstrap-download" "file://$repo"
+            mkdir -p "$work/bootstrap-tar"
+            tar --extract --gzip --file="$repo/bootstrap.tar.gz" --directory="$work/bootstrap-tar"
+            truncate --size=0 "$work/bootstrap-tar/debootstrap/base"
+            tar --create --gzip --file="$repo/bootstrap.tar.gz" --directory="$work/bootstrap-tar" .
+            repo_used_kb=$(du --summarize --block-size=1024 "$repo" | cut -f1)
+            repo_blocks=$((repo_used_kb + 65536))
+            repo_image="$work/repo.ext4"
+            truncate --size=$((repo_blocks * 4096)) "$repo_image"
+            mke2fs -q -F -t ext4 -d "$repo" "$repo_image" "$repo_blocks"
+            timeout --foreground 1200 "$qemu" -machine "$machine" -accel tcg,thread=multi -smp 4 -m 2048 -nographic \
               -kernel "$kernel_file" -initrd "$work/initrd.img" \
               -append "console=$console root=/dev/vda rw systemd.unit=multi-user.target" \
               -drive "file=$image,if=virtio,format=raw" \
+              -drive "file=$repo_image,if=virtio,format=raw,readonly=on" \
               -fsdev "local,id=share,path=$hostshare,security_model=none" \
+              -fsdev "local,id=nixshare,path=/nix,security_model=none" \
               -device virtio-9p-pci,fsdev=share,mount_tag=hostshare \
+              -device virtio-9p-pci,fsdev=nixshare,mount_tag=nixshare \
               -no-reboot
             [[ -e "$hostshare/rootfs-bootstrap-success" ]] || {
               printf 'QEMU bootstrap did not report success\n' >&2
               exit 1
             }
+            [[ -s "$hostshare/rootfs.kernel" && -s "$hostshare/rootfs.initrd" ]] || {
+              printf 'target kernel or initrd was not generated\n' >&2
+              exit 1
+            }
+            kernel_output="''${image}.kernel"
+            initrd_output="''${image}.initrd"
+            cp "$hostshare/rootfs.kernel" "$kernel_output"
+            cp "$hostshare/rootfs.initrd" "$initrd_output"
+            timeout --foreground 60 "$qemu" -machine "$machine" -m 1024 -nographic \
+              -kernel "$kernel_output" -initrd "$initrd_output" \
+              -append "console=$console root=/dev/vda rw systemd.unit=multi-user.target" \
+              -drive "file=$image,if=virtio,format=raw" \
+              -no-reboot
           '';
         }}/bin/mmdebstrap-rootfs";
         meta.description = "Build Debian or Ubuntu rootfs images, using QEMU for cross architectures";
